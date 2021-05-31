@@ -124,6 +124,9 @@ void Game::setGameState(GameState_t newState)
 
 			quests.loadFromXml();
 			mounts.loadFromXml();
+			auras.loadFromXml();
+			wings.loadFromXml();
+			shaders.loadFromXml();
 
 			loadMotdNum();
 			loadPlayersRecord();
