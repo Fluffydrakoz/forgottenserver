@@ -32,6 +32,7 @@
 #include "game.h"
 #include "iologindata.h"
 #include "iomarket.h"
+#include "waitlist.h"
 #include "ban.h"
 #include "scheduler.h"
 
@@ -39,104 +40,6 @@ extern ConfigManager g_config;
 extern Actions actions;
 extern CreatureEvents* g_creatureEvents;
 extern Chat* g_chat;
-
-namespace {
-
-using WaitList = std::deque<std::pair<int64_t, uint32_t>>; // (timeout, player guid)
-
-WaitList priorityWaitList, waitList;
-
-std::tuple<WaitList&, WaitList::iterator, WaitList::size_type> findClient(const Player& player) {
-	const auto fn = [&](const WaitList::value_type& it) { return it.second == player.getGUID(); };
-
-	auto it = std::find_if(priorityWaitList.begin(), priorityWaitList.end(), fn);
-	if (it != priorityWaitList.end()) {
-		return std::make_tuple(std::ref(priorityWaitList), it, std::distance(it, priorityWaitList.end()) + 1);
-	}
-
-	it = std::find_if(waitList.begin(), waitList.end(), fn);
-	if (it != waitList.end()) {
-		return std::make_tuple(std::ref(waitList), it, priorityWaitList.size() + std::distance(it, waitList.end()) + 1);
-	}
-
-	return std::make_tuple(std::ref(waitList), waitList.end(), priorityWaitList.size() + waitList.size());
-}
-
-uint8_t getWaitTime(std::size_t slot)
-{
-	if (slot < 5) {
-		return 5;
-	} else if (slot < 10) {
-		return 10;
-	} else if (slot < 20) {
-		return 20;
-	} else if (slot < 50) {
-		return 60;
-	} else {
-		return 120;
-	}
-}
-
-int64_t getTimeout(std::size_t slot)
-{
-	// timeout is set to 15 seconds longer than expected retry attempt
-	return getWaitTime(slot) + 15;
-}
-
-void cleanupList(WaitList& list)
-{
-	int64_t time = OTSYS_TIME();
-
-	auto it = list.begin();
-	while (it != list.end()) {
-		if (it->first <= time) {
-			it = list.erase(it);
-		} else {
-			++it;
-		}
-	}
-}
-
-std::size_t clientLogin(const Player& player)
-{
-	// Currentslot = position in wait list, 0 for direct access
-	if (player.hasFlag(PlayerFlag_CanAlwaysLogin) || player.getAccountType() >= ACCOUNT_TYPE_GAMEMASTER) {
-		return 0;
-	}
-
-	cleanupList(priorityWaitList);
-	cleanupList(waitList);
-
-	uint32_t maxPlayers = static_cast<uint32_t>(g_config.getNumber(ConfigManager::MAX_PLAYERS));
-	if (maxPlayers == 0 || (priorityWaitList.empty() && waitList.empty() && g_game.getPlayersOnline() < maxPlayers)) {
-		return 0;
-	}
-
-	auto result = findClient(player);
-	if (std::get<1>(result) != std::get<0>(result).end()) {
-		auto currentSlot = std::get<2>(result);
-		// If server has capacity for this client, let him in even though his current slot might be higher than 0.
-		if ((g_game.getPlayersOnline() + currentSlot) <= maxPlayers) {
-			std::get<0>(result).erase(std::get<1>(result));
-			return 0;
-		}
-
-		//let them wait a bit longer
-		std::get<1>(result)->second = OTSYS_TIME() + (getTimeout(currentSlot) * 1000);
-		return currentSlot;
-	}
-
-	auto currentSlot = priorityWaitList.size();
-	if (player.isPremium()) {
-		priorityWaitList.emplace_back(OTSYS_TIME() + (getTimeout(++currentSlot) * 1000), player.getGUID());
-	} else {
-		currentSlot += waitList.size();
-		waitList.emplace_back(OTSYS_TIME() + (getTimeout(++currentSlot) * 1000), player.getGUID());
-	}
-	return currentSlot;
-}
-
-}
 
 void ProtocolGame::release()
 {
@@ -153,6 +56,17 @@ void ProtocolGame::release()
 
 void ProtocolGame::login(const std::string& name, uint32_t accountId, OperatingSystem_t operatingSystem)
 {
+	// OTCv8 features and extended opcodes
+	if (otclientV8 || operatingSystem >= CLIENTOS_OTCLIENT_LINUX) {
+		if(otclientV8)
+			sendFeatures();
+		NetworkMessage opcodeMessage;
+		opcodeMessage.addByte(0x32);
+		opcodeMessage.addByte(0x00);
+		opcodeMessage.add<uint16_t>(0x00);
+		writeToOutputBuffer(opcodeMessage);
+	}
+
 	//dispatcher thread
 	Player* foundPlayer = g_game.getPlayerByName(name);
 	if (!foundPlayer || g_config.getBoolean(ConfigManager::ALLOW_CLONES)) {
@@ -205,8 +119,9 @@ void ProtocolGame::login(const std::string& name, uint32_t accountId, OperatingS
 			}
 		}
 
-		if (std::size_t currentSlot = clientLogin(*player)) {
-			uint8_t retryTime = getWaitTime(currentSlot);
+		std::size_t currentSlot = WaitingList::getInstance().clientLogin(player);
+		if (currentSlot > 0) {
+			uint8_t retryTime = WaitingList::getTime(currentSlot);
 			std::ostringstream ss;
 
 			ss << "Too many players online.\nYou are at place "
@@ -234,6 +149,7 @@ void ProtocolGame::login(const std::string& name, uint32_t accountId, OperatingS
 				return;
 			}
 		}
+		player->autoOpenContainers();
 
 		if (operatingSystem >= CLIENTOS_OTCLIENT_LINUX) {
 			player->registerCreatureEvent("ExtendedOpcode");
@@ -287,6 +203,7 @@ void ProtocolGame::connect(uint32_t playerId, OperatingSystem_t operatingSystem)
 
 	player->client = getThis();
 	sendAddCreature(player, player->getPosition(), 0, false);
+	player->autoOpenContainers();
 	player->lastIP = player->getIP();
 	player->lastLoginSaved = std::max<time_t>(time(nullptr), player->lastLoginSaved + 1);
 	acceptPackets = true;
@@ -320,7 +237,7 @@ void ProtocolGame::logout(bool displayEffect, bool forced)
 			}
 		}
 
-		if (displayEffect && player->getHealth() > 0 && !player->isInGhostMode()) {
+		if (displayEffect && player->getHealth() > 0) {
 			g_game.addMagicEffect(player->getPosition(), CONST_ME_POFF);
 		}
 	}
@@ -354,14 +271,6 @@ void ProtocolGame::onRecvFirstMessage(NetworkMessage& msg)
 	key[3] = msg.get<uint32_t>();
 	enableXTEAEncryption();
 	setXTEAKey(std::move(key));
-
-	if (operatingSystem >= CLIENTOS_OTCLIENT_LINUX) {
-		NetworkMessage opcodeMessage;
-		opcodeMessage.addByte(0x32);
-		opcodeMessage.addByte(0x00);
-		opcodeMessage.add<uint16_t>(0x00);
-		writeToOutputBuffer(opcodeMessage);
-	}
 
 	msg.skipBytes(1); // gamemaster flag
 
@@ -399,6 +308,12 @@ void ProtocolGame::onRecvFirstMessage(NetworkMessage& msg)
 	if (challengeTimestamp != timeStamp || challengeRandom != randNumber) {
 		disconnect();
 		return;
+	}
+
+	// OTCv8 version detection
+	uint16_t otcV8StringLength = msg.get<uint16_t>();
+	if(otcV8StringLength == 5 && msg.getString(5) == "OTCv8") {
+		otclientV8 = msg.get<uint16_t>(); // 253, 260, 261, ...
 	}
 
 	if (version < CLIENT_VERSION_MIN || version > CLIENT_VERSION_MAX) {
@@ -484,7 +399,7 @@ void ProtocolGame::writeToOutputBuffer(const NetworkMessage& msg)
 
 void ProtocolGame::parsePacket(NetworkMessage& msg)
 {
-	if (!acceptPackets || g_game.getGameState() == GAME_STATE_SHUTDOWN || msg.getLength() == 0) {
+	if (!acceptPackets || g_game.getGameState() == GAME_STATE_SHUTDOWN || msg.getLength() <= 0) {
 		return;
 	}
 
@@ -515,6 +430,9 @@ void ProtocolGame::parsePacket(NetworkMessage& msg)
 		case 0x1D: addGameTask(&Game::playerReceivePingBack, player->getID()); break;
 		case 0x1E: addGameTask(&Game::playerReceivePing, player->getID()); break;
 		case 0x32: parseExtendedOpcode(msg); break; //otclient extended opcode
+		case 0x40: parseNewPing(msg); break;
+		case 0x42: parseChangeAwareRange(msg); break;
+		case 0x45: parseNewWalking(msg); break;
 		case 0x64: parseAutoWalk(msg); break;
 		case 0x65: addGameTask(&Game::playerMove, player->getID(), DIRECTION_NORTH); break;
 		case 0x66: addGameTask(&Game::playerMove, player->getID(), DIRECTION_EAST); break;
@@ -606,10 +524,33 @@ void ProtocolGame::parsePacket(NetworkMessage& msg)
 
 void ProtocolGame::GetTileDescription(const Tile* tile, NetworkMessage& msg)
 {
-	msg.add<uint16_t>(0x00); //environmental effects
+	Item* ground = tile->getGround();
+	if (otclientV8) { // OTCLIENTV8 new walking
+		uint16_t groundSpeed = 150;
+		// I've noticed that sometimes ground speed was incorrect in otclient,
+		// so server just sends 100% correct ground speed
+		bool isBlocking = false;
+		// if isBlocking is true, next prewalking from this tile will be impossible
+		// till server confirmation/rejection, used for teleport or stairs
+		if (ground) {
+			groundSpeed = (uint16_t)Item::items[ground->getID()].speed;
+			if (groundSpeed == 0) {
+				groundSpeed = 150;
+			}
+			// you can uncomment to make walk animation slower when going into stairs, looks cool
+			// floor change speed is the same, only animation is slower 
+			//if(tile->hasFlag(TILESTATE_FLOORCHANGE))
+			//    groundSpeed *= 3;
+			if (tile->hasFlag(TILESTATE_FLOORCHANGE) || tile->hasFlag(TILESTATE_TELEPORT))
+				isBlocking = true;
+		}
+		msg.add<uint16_t>(groundSpeed);
+		msg.add<uint8_t>(isBlocking ? 1 : 0);
+	} else {
+		msg.add<uint16_t>(0x00); //environmental effects
+	}
 
 	int32_t count;
-	Item* ground = tile->getGround();
 	if (ground) {
 		msg.addItem(ground);
 		count = 1;
@@ -622,28 +563,43 @@ void ProtocolGame::GetTileDescription(const Tile* tile, NetworkMessage& msg)
 		for (auto it = items->getBeginTopItem(), end = items->getEndTopItem(); it != end; ++it) {
 			msg.addItem(*it);
 
-			if (++count == 10) {
+			count++;
+			if (count == 9 && tile->getPosition() == player->getPosition() && !otclientV8) {
 				break;
+			} else if (count == 10) {
+				return;
 			}
 		}
 	}
 
 	const CreatureVector* creatures = tile->getCreatures();
 	if (creatures) {
+		bool playerAdded = false;
 		for (const Creature* creature : boost::adaptors::reverse(*creatures)) {
 			if (!player->canSeeCreature(creature)) {
 				continue;
+			}
+
+			if (tile->getPosition() == player->getPosition() && count == 9 && !playerAdded && !otclientV8) {
+				creature = player;
+			}
+
+			if (creature->getID() == player->getID()) {
+				playerAdded = true;
 			}
 
 			bool known;
 			uint32_t removedKnown;
 			checkCreatureAsKnown(creature->getID(), known, removedKnown);
 			AddCreature(msg, creature, known, removedKnown);
-			++count;
+
+			if (++count == 10) {
+				return;
+			}
 		}
 	}
 
-	if (items && count < 10) {
+	if (items) {
 		for (auto it = items->getBeginDownItem(), end = items->getEndDownItem(); it != end; ++it) {
 			msg.addItem(*it);
 
@@ -768,7 +724,7 @@ bool ProtocolGame::canSee(int32_t x, int32_t y, int32_t z) const
 		if (z > 7) {
 			return false;
 		}
-	} else { // if (myPos.z >= 8) {
+	} else if (myPos.z >= 8) {
 		//we are underground (8 -> 15)
 		//view is +/- 2 from the floor we stand on
 		if (std::abs(myPos.getZ() - z) > 2) {
@@ -778,8 +734,8 @@ bool ProtocolGame::canSee(int32_t x, int32_t y, int32_t z) const
 
 	//negative offset means that the action taken place is on a lower floor than ourself
 	int32_t offsetz = myPos.getZ() - z;
-	if ((x >= myPos.getX() - 8 + offsetz) && (x <= myPos.getX() + 9 + offsetz) &&
-			(y >= myPos.getY() - 6 + offsetz) && (y <= myPos.getY() + 7 + offsetz)) {
+	if ((x >= myPos.getX() - awareRange.left() + offsetz) && (x <= myPos.getX() + awareRange.right() + offsetz) &&
+		(y >= myPos.getY() - awareRange.top() + offsetz) && (y <= myPos.getY() + awareRange.bottom() + offsetz)) {
 		return true;
 	}
 	return false;
@@ -825,20 +781,18 @@ void ProtocolGame::parseAutoWalk(NetworkMessage& msg)
 
 	msg.skipBytes(numdirs);
 
-	std::vector<Direction> path;
-	path.reserve(numdirs);
-
+	std::list<Direction> path;
 	for (uint8_t i = 0; i < numdirs; ++i) {
 		uint8_t rawdir = msg.getPreviousByte();
 		switch (rawdir) {
-			case 1: path.push_back(DIRECTION_EAST); break;
-			case 2: path.push_back(DIRECTION_NORTHEAST); break;
-			case 3: path.push_back(DIRECTION_NORTH); break;
-			case 4: path.push_back(DIRECTION_NORTHWEST); break;
-			case 5: path.push_back(DIRECTION_WEST); break;
-			case 6: path.push_back(DIRECTION_SOUTHWEST); break;
-			case 7: path.push_back(DIRECTION_SOUTH); break;
-			case 8: path.push_back(DIRECTION_SOUTHEAST); break;
+			case 1: path.push_front(DIRECTION_EAST); break;
+			case 2: path.push_front(DIRECTION_NORTHEAST); break;
+			case 3: path.push_front(DIRECTION_NORTH); break;
+			case 4: path.push_front(DIRECTION_NORTHWEST); break;
+			case 5: path.push_front(DIRECTION_WEST); break;
+			case 6: path.push_front(DIRECTION_SOUTHWEST); break;
+			case 7: path.push_front(DIRECTION_SOUTH); break;
+			case 8: path.push_front(DIRECTION_SOUTHEAST); break;
 			default: break;
 		}
 	}
@@ -847,7 +801,7 @@ void ProtocolGame::parseAutoWalk(NetworkMessage& msg)
 		return;
 	}
 
-	addGameTask(&Game::playerAutoWalk, player->getID(), std::move(path));
+	addGameTask(&Game::playerAutoWalk, player->getID(), path);
 }
 
 void ProtocolGame::parseSetOutfit(NetworkMessage& msg)
@@ -860,13 +814,24 @@ void ProtocolGame::parseSetOutfit(NetworkMessage& msg)
 	newOutfit.lookFeet = msg.getByte();
 	newOutfit.lookAddons = msg.getByte();
 	newOutfit.lookMount = msg.get<uint16_t>();
+	newOutfit.lookWings = otclientV8 ? msg.get<uint16_t>() : 0;
+	newOutfit.lookAura = otclientV8 ? msg.get<uint16_t>() : 0;
+	std::string shaderName = otclientV8 ? msg.getString() : "";
+	Shader* shader = g_game.shaders.getShaderByName(shaderName);
+	newOutfit.lookShader = shader ? shader->id : 0;
 	addGameTask(&Game::playerChangeOutfit, player->getID(), newOutfit);
 }
 
 void ProtocolGame::parseToggleMount(NetworkMessage& msg)
 {
-	bool mount = msg.getByte() != 0;
-	addGameTask(&Game::playerToggleMount, player->getID(), mount);
+	int mount = msg.get<int8_t>();
+	int wings = -1, aura = -1, shader = -1;
+	if (otclientV8 >= 254) {
+		wings = msg.get<int8_t>();
+		aura = msg.get<int8_t>();
+		shader = msg.get<int8_t>();
+	}
+	addGameTask(&Game::playerToggleOutfitExtension, player->getID(), mount, wings, aura, shader);
 }
 
 void ProtocolGame::parseUseItem(NetworkMessage& msg)
@@ -977,7 +942,7 @@ void ProtocolGame::parseSay(NetworkMessage& msg)
 void ProtocolGame::parseFightModes(NetworkMessage& msg)
 {
 	uint8_t rawFightMode = msg.getByte(); // 1 - offensive, 2 - balanced, 3 - defensive
-	uint8_t rawChaseMode = msg.getByte(); // 0 - stand while fighting, 1 - chase opponent
+	uint8_t rawChaseMode = msg.getByte(); // 0 - stand while fightning, 1 - chase opponent
 	uint8_t rawSecureMode = msg.getByte(); // 0 - can't attack unmarked, 1 - can attack unmarked
 	// uint8_t rawPvpMode = msg.getByte(); // pvp mode introduced in 10.0
 
@@ -1419,7 +1384,7 @@ void ProtocolGame::sendBasicData()
 	msg.addByte(0x9F);
 	if (player->isPremium()) {
 		msg.addByte(1);
-		msg.add<uint32_t>(g_config.getBoolean(ConfigManager::FREE_PREMIUM) ? 0 : player->premiumEndsAt);
+		msg.add<uint32_t>(time(nullptr) + (player->premiumDays * 86400));
 	} else {
 		msg.addByte(0);
 		msg.add<uint32_t>(0);
@@ -1562,10 +1527,10 @@ void ProtocolGame::sendContainer(uint8_t cid, const Container* container, bool h
 	msg.addByte(cid);
 
 	if (container->getID() == ITEM_BROWSEFIELD) {
-		msg.addItem(ITEM_BAG, 1);
+		msg.addItem(ITEM_BAG, 1, otclientV8);
 		msg.addString("Browse Field");
 	} else {
-		msg.addItem(container);
+		msg.addItem(container, otclientV8);
 		msg.addString(container->getName());
 	}
 
@@ -1584,7 +1549,7 @@ void ProtocolGame::sendContainer(uint8_t cid, const Container* container, bool h
 
 		msg.addByte(itemsToSend);
 		for (auto it = container->getItemList().begin() + firstIndex, end = it + itemsToSend; it != end; ++it) {
-			msg.addItem(*it);
+			msg.addItem(*it, otclientV8);
 		}
 	} else {
 		msg.addByte(0x00);
@@ -2179,11 +2144,11 @@ void ProtocolGame::sendTradeItemRequest(const std::string& traderName, const Ite
 
 		msg.addByte(itemList.size());
 		for (const Item* listItem : itemList) {
-			msg.addItem(listItem);
+			msg.addItem(listItem, otclientV8);
 		}
 	} else {
 		msg.addByte(0x01);
-		msg.addItem(item);
+		msg.addItem(item, otclientV8);
 	}
 	writeToOutputBuffer(msg);
 }
@@ -2211,14 +2176,8 @@ void ProtocolGame::sendCreatureTurn(const Creature* creature, uint32_t stackPos)
 
 	NetworkMessage msg;
 	msg.addByte(0x6B);
-	if (stackPos >= 10) {
-		msg.add<uint16_t>(0xFFFF);
-		msg.add<uint32_t>(creature->getID());
-	} else {
-		msg.addPosition(creature->getPosition());
-		msg.addByte(stackPos);
-	}
-
+	msg.addPosition(creature->getPosition());
+	msg.addByte(stackPos);
 	msg.add<uint16_t>(0x63);
 	msg.add<uint32_t>(creature->getID());
 	msg.addByte(creature->getDirection());
@@ -2263,6 +2222,9 @@ void ProtocolGame::sendToChannel(const Creature* creature, SpeakClasses type, co
 	msg.add<uint32_t>(++statementId);
 	if (!creature) {
 		msg.add<uint32_t>(0x00);
+	} else if (type == TALKTYPE_CHANNEL_R2) {
+		msg.add<uint32_t>(0x00);
+		type = TALKTYPE_CHANNEL_R1;
 	} else {
 		msg.addString(creature->getName());
 		//Add level only for players
@@ -2391,10 +2353,45 @@ void ProtocolGame::sendFYIBox(const std::string& message)
 //tile
 void ProtocolGame::sendMapDescription(const Position& pos)
 {
+	if (otclientV8) {
+		int32_t startz, endz, zstep;
+
+		if (pos.z > 7) {
+			startz = pos.z - 2;
+			endz = std::min<int32_t>(MAP_MAX_LAYERS - 1, pos.z + 2);
+			zstep = 1;
+		} else {
+			startz = 7;
+			endz = 0;
+			zstep = -1;
+		}
+
+		for (int32_t nz = startz; nz != endz + zstep; nz += zstep) {
+			sendFloorDescription(pos, nz);
+		}
+	} else {
+		NetworkMessage msg;
+		msg.addByte(0x64);
+		msg.addPosition(player->getPosition());
+		GetMapDescription(pos.x - awareRange.left(), pos.y - awareRange.top(), pos.z, awareRange.horizontal(), awareRange.vertical(), msg);
+		writeToOutputBuffer(msg);
+	}
+}
+
+void ProtocolGame::sendFloorDescription(const Position& pos, int floor)
+{
+	// When map view range is big, let's say 30x20 all floors may not fit in single packets
+	// So we split one packet with every floor to few packets with single floor
 	NetworkMessage msg;
-	msg.addByte(0x64);
+	msg.addByte(0x4B);
 	msg.addPosition(player->getPosition());
-	GetMapDescription(pos.x - 8, pos.y - 6, pos.z, 18, 14, msg);
+	msg.addByte(floor);
+	int32_t skip = -1;
+	GetFloorDescription(msg, pos.x - awareRange.left(), pos.y - awareRange.top(), floor, awareRange.horizontal(), awareRange.vertical(), pos.z - floor, skip);
+	if (skip >= 0) {
+		msg.addByte(skip);
+		msg.addByte(0xFF);
+	}
 	writeToOutputBuffer(msg);
 }
 
@@ -2410,6 +2407,8 @@ void ProtocolGame::sendAddTileItem(const Position& pos, uint32_t stackpos, const
 	msg.addByte(stackpos);
 	msg.addItem(item);
 	writeToOutputBuffer(msg);
+
+	checkPredictiveWalking(pos);
 }
 
 void ProtocolGame::sendUpdateTileItem(const Position& pos, uint32_t stackpos, const Item* item)
@@ -2424,6 +2423,8 @@ void ProtocolGame::sendUpdateTileItem(const Position& pos, uint32_t stackpos, co
 	msg.addByte(stackpos);
 	msg.addItem(item);
 	writeToOutputBuffer(msg);
+
+	checkPredictiveWalking(pos);
 }
 
 void ProtocolGame::sendRemoveTileThing(const Position& pos, uint32_t stackpos)
@@ -2434,26 +2435,6 @@ void ProtocolGame::sendRemoveTileThing(const Position& pos, uint32_t stackpos)
 
 	NetworkMessage msg;
 	RemoveTileThing(msg, pos, stackpos);
-	writeToOutputBuffer(msg);
-}
-
-void ProtocolGame::sendRemoveTileCreature(const Creature* creature, const Position& pos, uint32_t stackpos)
-{
-	if (stackpos < 10) {
-		if (!canSee(pos)) {
-			return;
-		}
-
-		NetworkMessage msg;
-		RemoveTileThing(msg, pos, stackpos);
-		writeToOutputBuffer(msg);
-		return;
-	}
-
-	NetworkMessage msg;
-	msg.addByte(0x6C);
-	msg.add<uint16_t>(0xFFFF);
-	msg.add<uint32_t>(creature->getID());
 	writeToOutputBuffer(msg);
 }
 
@@ -2511,19 +2492,7 @@ void ProtocolGame::sendAddCreature(const Creature* creature, const Position& pos
 	}
 
 	if (creature != player) {
-		// stack pos is always real index now, so it can exceed the limit
-		// if stack pos exceeds the limit, we need to refresh the tile instead
-		// 1. this is a rare case, and is only triggered by forcing summon in a position
-		// 2. since no stackpos will be send to the client about that creature, removing
-		//    it must be done with its id if its stackpos remains >= 10. this is done to
-		//    add creatures to battle list instead of rendering on screen
-		if (stackpos >= 10) {
-			// @todo: should we avoid this check?
-			if (const Tile* tile = creature->getTile()) {
-				sendUpdateTile(tile, pos);
-			}
-		} else {
-			// if stackpos is -1, the client will automatically detect it
+		if (stackpos != -1) {
 			NetworkMessage msg;
 			msg.addByte(0x6A);
 			msg.addPosition(pos);
@@ -2539,6 +2508,8 @@ void ProtocolGame::sendAddCreature(const Creature* creature, const Position& pos
 		if (isLogin) {
 			sendMagicEffect(pos, CONST_ME_TELEPORT);
 		}
+
+		checkPredictiveWalking(pos);
 		return;
 	}
 
@@ -2579,8 +2550,6 @@ void ProtocolGame::sendAddCreature(const Creature* creature, const Position& pos
 		sendInventoryItem(static_cast<slots_t>(i), player->getInventoryItem(static_cast<slots_t>(i)));
 	}
 
-	sendInventoryItem(CONST_SLOT_STORE_INBOX, player->getStoreInbox()->getItem());
-
 	sendStats();
 	sendSkills();
 
@@ -2599,23 +2568,25 @@ void ProtocolGame::sendAddCreature(const Creature* creature, const Position& pos
 void ProtocolGame::sendMoveCreature(const Creature* creature, const Position& newPos, int32_t newStackPos, const Position& oldPos, int32_t oldStackPos, bool teleport)
 {
 	if (creature == player) {
-		if (teleport) {
-			sendRemoveTileCreature(creature, oldPos, oldStackPos);
+		if (oldStackPos >= 10) {
+			sendMapDescription(newPos);
+		} else if (teleport) {
+			NetworkMessage msg;
+			RemoveTileThing(msg, oldPos, oldStackPos);
+			writeToOutputBuffer(msg);
 			sendMapDescription(newPos);
 		} else {
 			NetworkMessage msg;
 			if (oldPos.z == 7 && newPos.z >= 8) {
-				RemoveTileCreature(msg, creature, oldPos, oldStackPos);
+				RemoveTileThing(msg, oldPos, oldStackPos);
 			} else {
 				msg.addByte(0x6D);
-				if (oldStackPos < 10) {
-					msg.addPosition(oldPos);
-					msg.addByte(oldStackPos);
-				} else {
-					msg.add<uint16_t>(0xFFFF);
-					msg.add<uint32_t>(creature->getID());
-				}
+				msg.addPosition(oldPos);
+				msg.addByte(oldStackPos);
 				msg.addPosition(newPos);
+				if (otclientV8) {
+					msg.add<uint16_t>(creature->getStepDuration(true));
+				}
 			}
 
 			if (newPos.z > oldPos.z) {
@@ -2624,42 +2595,42 @@ void ProtocolGame::sendMoveCreature(const Creature* creature, const Position& ne
 				MoveUpCreature(msg, creature, newPos, oldPos);
 			}
 
-			if (oldPos.y > newPos.y) { // north, for old x
+			if (oldPos.y > newPos.y) { // north, for old x              
 				msg.addByte(0x65);
-				GetMapDescription(oldPos.x - 8, newPos.y - 6, newPos.z, 18, 1, msg);
+				GetMapDescription(oldPos.x - awareRange.left(), newPos.y - awareRange.top(), newPos.z, awareRange.horizontal(), 1, msg);
 			} else if (oldPos.y < newPos.y) { // south, for old x
 				msg.addByte(0x67);
-				GetMapDescription(oldPos.x - 8, newPos.y + 7, newPos.z, 18, 1, msg);
+				GetMapDescription(oldPos.x - awareRange.left(), newPos.y + awareRange.bottom(), newPos.z, awareRange.horizontal(), 1, msg);
 			}
 
 			if (oldPos.x < newPos.x) { // east, [with new y]
 				msg.addByte(0x66);
-				GetMapDescription(newPos.x + 9, newPos.y - 6, newPos.z, 1, 14, msg);
+				GetMapDescription(newPos.x + awareRange.right(), newPos.y - awareRange.top(), newPos.z, 1, awareRange.vertical(), msg);
 			} else if (oldPos.x > newPos.x) { // west, [with new y]
 				msg.addByte(0x68);
-				GetMapDescription(newPos.x - 8, newPos.y - 6, newPos.z, 1, 14, msg);
+				GetMapDescription(newPos.x - awareRange.left(), newPos.y - awareRange.top(), newPos.z, 1, awareRange.vertical(), msg);
 			}
 			writeToOutputBuffer(msg);
 		}
 	} else if (canSee(oldPos) && canSee(creature->getPosition())) {
-		if (teleport || (oldPos.z == 7 && newPos.z >= 8)) {
-			sendRemoveTileCreature(creature, oldPos, oldStackPos);
+		if (teleport || (oldPos.z == 7 && newPos.z >= 8) || oldStackPos >= 10) {
+			sendRemoveTileThing(oldPos, oldStackPos);
 			sendAddCreature(creature, newPos, newStackPos, false);
 		} else {
 			NetworkMessage msg;
 			msg.addByte(0x6D);
-			if (oldStackPos < 10) {
-				msg.addPosition(oldPos);
-				msg.addByte(oldStackPos);
-			} else {
-				msg.add<uint16_t>(0xFFFF);
-				msg.add<uint32_t>(creature->getID());
-			}
+			msg.addPosition(oldPos);
+			msg.addByte(oldStackPos);
 			msg.addPosition(creature->getPosition());
+			if (otclientV8) {
+				msg.add<uint16_t>(creature->getStepDuration(true));
+			}
 			writeToOutputBuffer(msg);
+			checkPredictiveWalking(oldPos);
+			checkPredictiveWalking(newPos);
 		}
 	} else if (canSee(oldPos)) {
-		sendRemoveTileCreature(creature, oldPos, oldStackPos);
+		sendRemoveTileThing(oldPos, oldStackPos);
 	} else if (canSee(creature->getPosition())) {
 		sendAddCreature(creature, newPos, newStackPos, false);
 	}
@@ -2671,7 +2642,7 @@ void ProtocolGame::sendInventoryItem(slots_t slot, const Item* item)
 	if (item) {
 		msg.addByte(0x78);
 		msg.addByte(slot);
-		msg.addItem(item);
+		msg.addItem(item, otclientV8);
 	} else {
 		msg.addByte(0x79);
 		msg.addByte(slot);
@@ -2707,7 +2678,7 @@ void ProtocolGame::sendAddContainerItem(uint8_t cid, uint16_t slot, const Item* 
 	msg.addByte(0x70);
 	msg.addByte(cid);
 	msg.add<uint16_t>(slot);
-	msg.addItem(item);
+	msg.addItem(item, otclientV8);
 	writeToOutputBuffer(msg);
 }
 
@@ -2717,7 +2688,7 @@ void ProtocolGame::sendUpdateContainerItem(uint8_t cid, uint16_t slot, const Ite
 	msg.addByte(0x71);
 	msg.addByte(cid);
 	msg.add<uint16_t>(slot);
-	msg.addItem(item);
+	msg.addItem(item, otclientV8);
 	writeToOutputBuffer(msg);
 }
 
@@ -2728,7 +2699,7 @@ void ProtocolGame::sendRemoveContainerItem(uint8_t cid, uint16_t slot, const Ite
 	msg.addByte(cid);
 	msg.add<uint16_t>(slot);
 	if (lastItem) {
-		msg.addItem(lastItem);
+		msg.addItem(lastItem, otclientV8);
 	} else {
 		msg.add<uint16_t>(0x00);
 	}
@@ -2740,7 +2711,7 @@ void ProtocolGame::sendTextWindow(uint32_t windowTextId, Item* item, uint16_t ma
 	NetworkMessage msg;
 	msg.addByte(0x96);
 	msg.add<uint32_t>(windowTextId);
-	msg.addItem(item);
+	msg.addItem(item, otclientV8);
 
 	if (canWrite) {
 		msg.add<uint16_t>(maxlen);
@@ -2773,7 +2744,7 @@ void ProtocolGame::sendTextWindow(uint32_t windowTextId, uint32_t itemId, const 
 	NetworkMessage msg;
 	msg.addByte(0x96);
 	msg.add<uint32_t>(windowTextId);
-	msg.addItem(itemId, 1);
+	msg.addItem(itemId, 1, otclientV8);
 	msg.add<uint16_t>(text.size());
 	msg.addString(text);
 	msg.add<uint16_t>(0x00);
@@ -2819,7 +2790,7 @@ void ProtocolGame::sendOutfitWindow()
 		}
 
 		protocolOutfits.emplace_back(outfit.name, outfit.lookType, addons);
-		if (protocolOutfits.size() == std::numeric_limits<uint8_t>::max()) { // Game client currently doesn't allow more than 255 outfits
+		if (protocolOutfits.size() == 100) { // Game client doesn't allow more than 100 outfits
 			break;
 		}
 	}
@@ -2842,6 +2813,47 @@ void ProtocolGame::sendOutfitWindow()
 	for (const Mount* mount : mounts) {
 		msg.add<uint16_t>(mount->clientId);
 		msg.addString(mount->name);
+	}
+
+	if (otclientV8) {
+		std::vector<const Wing*> wings;
+		for (const Wing& wing: g_game.wings.getWings()) {
+			if (player->hasWing(&wing)) {
+				wings.push_back(&wing);
+			}
+		}
+
+		msg.addByte(wings.size());
+		for (const Wing* wing : wings) {
+			msg.add<uint16_t>(wing->clientId);
+			msg.addString(wing->name);
+		}
+
+		std::vector<const Aura*> auras;
+		for (const Aura& aura : g_game.auras.getAuras()) {
+			if (player->hasAura(&aura)) {
+				auras.push_back(&aura);
+			}
+		}
+
+		msg.addByte(auras.size());
+		for (const Aura* aura : auras) {
+			msg.add<uint16_t>(aura->clientId);
+			msg.addString(aura->name);
+		}
+
+		std::vector<const Shader*> shaders;
+		for (const Shader& shader : g_game.shaders.getShaders()) {
+			if (player->hasShader(&shader)) {
+				shaders.push_back(&shader);
+			}
+		}
+
+		msg.addByte(shaders.size());
+		for (const Shader* shader : shaders) {
+			msg.add<uint16_t>(shader->id);
+			msg.addString(shader->name);
+		}
 	}
 
 	writeToOutputBuffer(msg);
@@ -3079,6 +3091,12 @@ void ProtocolGame::AddOutfit(NetworkMessage& msg, const Outfit_t& outfit)
 	}
 
 	msg.add<uint16_t>(outfit.lookMount);
+	if (otclientV8) {
+		msg.add<uint16_t>(outfit.lookWings);
+		msg.add<uint16_t>(outfit.lookAura);
+		Shader* shader = g_game.shaders.getShaderByID(outfit.lookShader);
+		msg.addString(shader ? shader->name : "");
+	}
 }
 
 void ProtocolGame::AddWorldLight(NetworkMessage& msg, LightInfo lightInfo)
@@ -3110,18 +3128,6 @@ void ProtocolGame::RemoveTileThing(NetworkMessage& msg, const Position& pos, uin
 	msg.addByte(stackpos);
 }
 
-void ProtocolGame::RemoveTileCreature(NetworkMessage& msg, const Creature* creature, const Position& pos, uint32_t stackpos)
-{
-	if (stackpos < 10) {
-		RemoveTileThing(msg, pos, stackpos);
-		return;
-	}
-
-	msg.addByte(0x6C);
-	msg.add<uint16_t>(0xFFFF);
-	msg.add<uint32_t>(creature->getID());
-}
-
 void ProtocolGame::MoveUpCreature(NetworkMessage& msg, const Creature* creature, const Position& newPos, const Position& oldPos)
 {
 	if (creature != player) {
@@ -3134,22 +3140,27 @@ void ProtocolGame::MoveUpCreature(NetworkMessage& msg, const Creature* creature,
 	//going to surface
 	if (newPos.z == 7) {
 		int32_t skip = -1;
-		GetFloorDescription(msg, oldPos.x - 8, oldPos.y - 6, 5, 18, 14, 3, skip); //(floor 7 and 6 already set)
-		GetFloorDescription(msg, oldPos.x - 8, oldPos.y - 6, 4, 18, 14, 4, skip);
-		GetFloorDescription(msg, oldPos.x - 8, oldPos.y - 6, 3, 18, 14, 5, skip);
-		GetFloorDescription(msg, oldPos.x - 8, oldPos.y - 6, 2, 18, 14, 6, skip);
-		GetFloorDescription(msg, oldPos.x - 8, oldPos.y - 6, 1, 18, 14, 7, skip);
-		GetFloorDescription(msg, oldPos.x - 8, oldPos.y - 6, 0, 18, 14, 8, skip);
-
-		if (skip >= 0) {
-			msg.addByte(skip);
-			msg.addByte(0xFF);
+		if (otclientV8) {
+			for (int z = 5; z >= 0; --z) {
+				sendFloorDescription(oldPos, z);
+			}
+		} else {
+			GetFloorDescription(msg, oldPos.x - awareRange.left(), oldPos.y - awareRange.top(), 5, awareRange.horizontal(), awareRange.vertical(), 3, skip); //(floor 7 and 6 already set)
+			GetFloorDescription(msg, oldPos.x - awareRange.left(), oldPos.y - awareRange.top(), 4, awareRange.horizontal(), awareRange.vertical(), 4, skip);
+			GetFloorDescription(msg, oldPos.x - awareRange.left(), oldPos.y - awareRange.top(), 3, awareRange.horizontal(), awareRange.vertical(), 5, skip);
+			GetFloorDescription(msg, oldPos.x - awareRange.left(), oldPos.y - awareRange.top(), 2, awareRange.horizontal(), awareRange.vertical(), 6, skip);
+			GetFloorDescription(msg, oldPos.x - awareRange.left(), oldPos.y - awareRange.top(), 1, awareRange.horizontal(), awareRange.vertical(), 7, skip);
+			GetFloorDescription(msg, oldPos.x - awareRange.left(), oldPos.y - awareRange.top(), 0, awareRange.horizontal(), awareRange.vertical(), 8, skip);
+			if (skip >= 0) {
+				msg.addByte(skip);
+				msg.addByte(0xFF);
+			}
 		}
 	}
 	//underground, going one floor up (still underground)
 	else if (newPos.z > 7) {
 		int32_t skip = -1;
-		GetFloorDescription(msg, oldPos.x - 8, oldPos.y - 6, oldPos.getZ() - 3, 18, 14, 3, skip);
+		GetFloorDescription(msg, oldPos.x - awareRange.left(), oldPos.y - awareRange.top(), oldPos.getZ() - 3, awareRange.horizontal(), awareRange.vertical(), 3, skip);
 
 		if (skip >= 0) {
 			msg.addByte(skip);
@@ -3160,11 +3171,11 @@ void ProtocolGame::MoveUpCreature(NetworkMessage& msg, const Creature* creature,
 	//moving up a floor up makes us out of sync
 	//west
 	msg.addByte(0x68);
-	GetMapDescription(oldPos.x - 8, oldPos.y - 5, newPos.z, 1, 14, msg);
+	GetMapDescription(oldPos.x - awareRange.left(), oldPos.y - (awareRange.top() - 1), newPos.z, 1, awareRange.vertical(), msg);
 
 	//north
 	msg.addByte(0x65);
-	GetMapDescription(oldPos.x - 8, oldPos.y - 6, newPos.z, 18, 1, msg);
+	GetMapDescription(oldPos.x - awareRange.left(), oldPos.y - awareRange.top(), newPos.z, awareRange.horizontal(), 1, msg);
 }
 
 void ProtocolGame::MoveDownCreature(NetworkMessage& msg, const Creature* creature, const Position& newPos, const Position& oldPos)
@@ -3180,19 +3191,24 @@ void ProtocolGame::MoveDownCreature(NetworkMessage& msg, const Creature* creatur
 	if (newPos.z == 8) {
 		int32_t skip = -1;
 
-		GetFloorDescription(msg, oldPos.x - 8, oldPos.y - 6, newPos.z, 18, 14, -1, skip);
-		GetFloorDescription(msg, oldPos.x - 8, oldPos.y - 6, newPos.z + 1, 18, 14, -2, skip);
-		GetFloorDescription(msg, oldPos.x - 8, oldPos.y - 6, newPos.z + 2, 18, 14, -3, skip);
-
-		if (skip >= 0) {
-			msg.addByte(skip);
-			msg.addByte(0xFF);
+		if (otclientV8) {
+			for (int z = 0; z < 3; ++z) {
+				sendFloorDescription(oldPos, newPos.z + z);
+			}
+		} else {
+			GetFloorDescription(msg, oldPos.x - awareRange.left(), oldPos.y - awareRange.top(), newPos.z, awareRange.horizontal(), awareRange.vertical(), -1, skip);
+			GetFloorDescription(msg, oldPos.x - awareRange.left(), oldPos.y - awareRange.top(), newPos.z + 1, awareRange.horizontal(), awareRange.vertical(), -2, skip);
+			GetFloorDescription(msg, oldPos.x - awareRange.left(), oldPos.y - awareRange.top(), newPos.z + 2, awareRange.horizontal(), awareRange.vertical(), -3, skip);
+			if (skip >= 0) {
+				msg.addByte(skip);
+				msg.addByte(0xFF);
+			}
 		}
 	}
 	//going further down
 	else if (newPos.z > oldPos.z && newPos.z > 8 && newPos.z < 14) {
 		int32_t skip = -1;
-		GetFloorDescription(msg, oldPos.x - 8, oldPos.y - 6, newPos.z + 2, 18, 14, -3, skip);
+		GetFloorDescription(msg, oldPos.x - awareRange.left(), oldPos.y - awareRange.top(), newPos.z + 2, awareRange.horizontal(), awareRange.vertical(), -3, skip);
 
 		if (skip >= 0) {
 			msg.addByte(skip);
@@ -3203,11 +3219,11 @@ void ProtocolGame::MoveDownCreature(NetworkMessage& msg, const Creature* creatur
 	//moving down a floor makes us out of sync
 	//east
 	msg.addByte(0x66);
-	GetMapDescription(oldPos.x + 9, oldPos.y - 7, newPos.z, 1, 14, msg);
+	GetMapDescription(newPos.x + awareRange.right(), newPos.y - awareRange.top(), newPos.z, 1, awareRange.vertical(), msg);
 
 	//south
 	msg.addByte(0x67);
-	GetMapDescription(oldPos.x - 8, oldPos.y + 7, newPos.z, 18, 1, msg);
+	GetMapDescription(newPos.x - awareRange.left(), newPos.y - awareRange.top(), newPos.z, 1, awareRange.vertical(), msg);
 }
 
 void ProtocolGame::AddShopItem(NetworkMessage& msg, const ShopInfo& item)
@@ -3234,4 +3250,211 @@ void ProtocolGame::parseExtendedOpcode(NetworkMessage& msg)
 
 	// process additional opcodes via lua script event
 	addGameTask(&Game::parsePlayerExtendedOpcode, player->getID(), opcode, buffer);
+}
+
+// OTCv8
+void ProtocolGame::sendFeatures()
+{
+	if(!otclientV8) 
+		return;
+
+	std::map<GameFeature, bool> features;
+	// place for non-standard OTCv8 features
+	features[GameExtendedOpcode] = true;
+	features[GameChangeMapAwareRange] = true;
+	features[GameNewWalking] = true;
+	features[GameEnvironmentEffect] = false; // disable it, useless 2 byte with every tile
+	features[GameExtendedClientPing] = true; 
+	features[GameItemTooltip] = true; // fully available from version 2.6
+	features[GameWingsAndAura] = true;
+	features[GameOutfitShaders] = true;
+
+	// packet compression
+	// we don't send feature, because feature assumes all packets are compressed
+	// if adler32 is enabled then compression can be detected automaticly, just adlre32 must be 0
+	if (g_config.getBoolean(ConfigManager::PACKET_COMPRESSION)) {
+		enableCompression();
+	}
+
+	if(features.empty())
+		return;
+
+	auto msg = getOutputBuffer(1024);
+	msg->addByte(0x43);
+	msg->add<uint16_t>(features.size());
+	for(auto& feature : features) {
+		msg->addByte((uint8_t)feature.first);
+		msg->addByte(feature.second ? 1 : 0);
+	}
+
+	send(std::move(getCurrentBuffer())); // send this packet immediately
+}
+
+void ProtocolGame::parseChangeAwareRange(NetworkMessage& msg)
+{
+	uint8_t width = msg.get<uint8_t>();
+	uint8_t height = msg.get<uint8_t>();
+
+	g_dispatcher.addTask(createTask(std::bind(&ProtocolGame::updateAwareRange, getThis(), width, height)));
+}
+
+void ProtocolGame::updateAwareRange(int width, int height)
+{
+	if (!otclientV8)
+		return;
+
+	// If you want to change max awareRange, edit maxViewportX, maxViewportY, maxClientViewportX, maxClientViewportY in map.h
+	awareRange.width = std::min(Map::maxViewportX * 2 - 1, std::min(Map::maxClientViewportX * 2 + 1, std::max(15, width)));
+	awareRange.height = std::min(Map::maxViewportY * 2 - 1, std::min(Map::maxClientViewportY * 2 + 1, std::max(11, height)));
+	// numbers must be odd
+	if (awareRange.width % 2 != 1)
+		awareRange.width -= 1;
+	if (awareRange.height % 2 != 1)
+		awareRange.height -= 1;
+
+	sendAwareRange();
+	sendMapDescription(player->getPosition()); // refresh map
+}
+
+void ProtocolGame::sendAwareRange()
+{
+	if (!otclientV8)
+		return;
+
+	NetworkMessage msg;
+	msg.addByte(0x42);
+	msg.add<uint8_t>(awareRange.width);
+	msg.add<uint8_t>(awareRange.height);
+	writeToOutputBuffer(msg);
+}
+
+void ProtocolGame::parseNewWalking(NetworkMessage& msg)
+{
+	uint32_t playerWalkId = msg.get<uint32_t>();
+	int32_t predictiveWalkId = msg.get<int32_t>(); // extension for proxy system, currently not used
+	Position playerPosition = msg.getPosition(); // local player position before moving, including prewalk
+	uint8_t flags = msg.getByte(); // 0x01 - prewalk, 0x02 - autowalk
+
+	uint16_t numdirs = msg.get<uint16_t>();
+	if (numdirs == 0 || numdirs > 4096) {
+		return;
+	}
+
+	std::list<Direction> path;
+	for (uint16_t i = 0; i < numdirs; ++i) {
+		uint8_t rawdir = msg.getByte();
+		switch (rawdir) {
+		case 1: path.push_back(DIRECTION_EAST); break;
+		case 2: path.push_back(DIRECTION_NORTHEAST); break;
+		case 3: path.push_back(DIRECTION_NORTH); break;
+		case 4: path.push_back(DIRECTION_NORTHWEST); break;
+		case 5: path.push_back(DIRECTION_WEST); break;
+		case 6: path.push_back(DIRECTION_SOUTHWEST); break;
+		case 7: path.push_back(DIRECTION_SOUTH); break;
+		case 8: path.push_back(DIRECTION_SOUTHEAST); break;
+		default: break;
+		}
+	}
+
+
+	uint32_t playerId = player->getID();
+
+	auto self(getThis());
+	g_dispatcher.addTask(createTask([self, playerWalkId, predictiveWalkId, playerId, playerPosition, flags, path] {
+		bool preWalk = flags & 0x01;
+		Position destination = getNextPosition(*(path.begin()), playerPosition);
+		if (preWalk && predictiveWalkId < self->walkMatrix.get(destination)) {
+			self->walkId += 1;
+			self->sendWalkId();
+			return;
+		}
+
+		if (playerWalkId < self->walkId) {
+			// this walk has been sent before player received previous newCancelWalk, so it's invalid, ignore it
+			return;
+		}
+
+		g_game.playerNewWalk(playerId, playerPosition, flags, path);
+	}));
+}
+
+void ProtocolGame::checkPredictiveWalking(const Position& pos)
+{
+	if (!otclientV8)
+		return;
+
+	if (walkMatrix.inRange(pos) && !g_game.map.canWalkTo(*player, pos)) {
+		int newValue = walkMatrix.update(pos);
+		sendPredictiveCancel(pos, newValue);
+	}
+}
+
+void ProtocolGame::sendPredictiveCancel(const Position& pos, int value)
+{
+	if (!otclientV8)
+		return;
+
+	NetworkMessage msg;
+	msg.addByte(0x46);
+	msg.addPosition(pos);
+	msg.addByte(player->getDirection());
+	writeToOutputBuffer(msg);
+}
+
+void ProtocolGame::sendWalkId()
+{
+	if (!otclientV8)
+		return;
+
+	NetworkMessage msg;
+	msg.addByte(0x47);
+	msg.add<uint32_t>(walkId);
+	writeToOutputBuffer(msg);
+}
+
+void ProtocolGame::sendNewCancelWalk()
+{
+	if (!otclientV8)
+		return;
+
+	NetworkMessage msg;
+	msg.addByte(0x45);
+	msg.addByte(player->getDirection());
+	writeToOutputBuffer(msg);
+	walkId += 1;
+	sendWalkId();
+}
+
+void ProtocolGame::parseNewPing(NetworkMessage& msg)
+{
+	uint32_t pingId = msg.get<uint32_t>();
+	uint16_t localPing = msg.get<uint16_t>();
+	uint16_t fps = msg.get<uint16_t>();
+
+	addGameTask(&Game::playerReceiveNewPing, player->getID(), localPing, fps);
+	g_dispatcher.addTask(createTask(std::bind(&ProtocolGame::sendNewPing, getThis(), pingId)));
+}
+
+void ProtocolGame::sendNewPing(uint32_t pingId)
+{
+	if (!otclientV8)
+		return;
+
+	NetworkMessage msg;
+	msg.addByte(0x40);
+	msg.add<uint32_t>(pingId);
+	writeToOutputBuffer(msg);
+}
+
+void ProtocolGame::sendProgressbar(uint32_t id, uint32_t duration, bool ltr)
+{
+	if (!otclientV8 || otclientV8 < 260)
+		return;
+	
+    NetworkMessage msg;
+    msg.addByte(0x3b);
+    msg.add<uint32_t>(id);
+    msg.add<uint32_t>(duration);
+    msg.addByte(ltr);
+    writeToOutputBuffer(msg);
 }
