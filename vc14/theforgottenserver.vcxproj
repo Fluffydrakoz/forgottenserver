@@ -240,6 +240,9 @@
     <ClCompile Include="..\src\vocation.cpp" />
     <ClCompile Include="..\src\weapons.cpp" />
     <ClCompile Include="..\src\wildcardtree.cpp" />
+		<ClCompile Include="..\src\wings.cpp" />
+		<ClCompile Include="..\src\shaders.cpp" />
+		<ClCompile Include="..\src\auras.cpp" />
     <ClCompile Include="..\src\xtea.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -328,6 +331,9 @@
     <ClInclude Include="..\src\vocation.h" />
     <ClInclude Include="..\src\weapons.h" />
     <ClInclude Include="..\src\wildcardtree.h" />
+		<ClInclude Include="..\src\wings.h" />
+	  <ClInclude Include="..\src\shaders.h" />
+		<ClInclude Include="..\src\auras.h" />
     <ClInclude Include="..\src\xtea.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
